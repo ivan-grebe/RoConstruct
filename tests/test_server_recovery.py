@@ -1,4 +1,5 @@
 """Tunnel rotation must not retire workers or strand the public server."""
+import json
 from unittest.mock import Mock, patch
 from pathlib import Path
 
@@ -40,6 +41,43 @@ def test_reconnect_closes_old_connection_and_keeps_token():
     connection.close.assert_called_once()
     assert api.server == "https://new.trycloudflare.com"
     assert api.token == "secret"
+
+
+@pytest.mark.parametrize("failure", ["gateway", "connection"])
+def test_heartbeat_retries_transient_failure_on_its_own_connection(failure):
+    api = worker.Api("https://fixed.example")
+    connection = Mock()
+    success = Mock(status=200)
+    success.read.return_value = b'{"ok":true}'
+    if failure == "gateway":
+        failed = Mock(status=502, reason="Bad Gateway")
+        failed.read.return_value = b"Bad Gateway"
+        connection.getresponse.side_effect = [failed, success]
+    else:
+        connection.request.side_effect = [OSError("TLS connection dropped"), None]
+        connection.getresponse.return_value = success
+    with patch.object(api, "_get_conn", return_value=connection), patch.object(worker.time, "sleep"):
+        assert api.call("/v1/heartbeat", {"lease": "same-lease"}) == {"ok": True}
+    assert [call.args[1] for call in connection.request.call_args_list] == ["/v1/heartbeat"] * 2
+    assert all(json.loads(call.kwargs["body"]) == {"lease": "same-lease"}
+               for call in connection.request.call_args_list)
+
+
+def test_heartbeat_outage_is_bounded_and_rejected_lease_is_not_retried():
+    api = worker.Api("https://fixed.example")
+    connection = Mock()
+    connection.request.side_effect = OSError("offline")
+    with patch.object(api, "_get_conn", return_value=connection), patch.object(worker.time, "sleep"):
+        with pytest.raises(worker.ApiFailure, match="offline"):
+            api.call("/v1/heartbeat", {"lease": "lease"})
+    assert connection.request.call_count == 3
+    connection.reset_mock(side_effect=True)
+    response = Mock(status=200)
+    response.read.return_value = b'{"ok":false}'
+    connection.getresponse.return_value = response
+    with patch.object(api, "_get_conn", return_value=connection):
+        assert api.call("/v1/heartbeat", {"lease": "lease"}) == {"ok": False}
+    assert connection.request.call_count == 1
 
 
 def test_rotated_server_still_offline_does_not_escape_worker():

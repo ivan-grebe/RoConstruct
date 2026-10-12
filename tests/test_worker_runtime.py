@@ -1,11 +1,88 @@
 """Regressions observed while running real bounded worker batches."""
 import json
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from roc import draft, match, metrics, mutate, repair, worker
+
+
+@pytest.mark.parametrize("kind,elapsed,expected", [("round", 330, 100), ("stream", 330, 100),
+                                                 ("compile", 330, 100), ("silent", 330, 0),
+                                                 ("stream", 601, 0)])
+def test_watchdog_accepts_progress_across_a_long_model_phase(kind, elapsed, expected):
+    clock, threads, logs = [0], [], []
+    stop = Mock()
+    stop.wait.side_effect = [False, True]
+    import threading
+    events = [threading.Event(), stop, threading.Event()]
+    job = dict(client="C", addr="00401000", size=32, unit="U", score=0, source=None, lease="lease")
+    api = Mock(servers=["http://localhost:8765"], token=None)
+    api.call.side_effect = lambda path, data=None: ([] if path.startswith("/v1/examples")
+                                                   else {"stored": 100, "verified": True})
+
+    def rounds(*args, **kwargs):
+        # Three useful rounds span more than the old five-minute stage limit.
+        for tick in (100, 200, elapsed):
+            clock[0] = tick
+            if kind == "round":
+                args[6]("  round: making progress")
+            elif kind == "stream":
+                kwargs["provider_options"]["on_progress"]()
+            elif kind == "compile":
+                kwargs["provider_options"]["check_candidate"]("C", job["addr"], "int f() {}")
+        threads[1]()  # one watchdog poll after 330 seconds
+        return 100, "int f() { return 1; }"
+
+    def thread(*args, **kwargs):
+        threads.append(kwargs["target"])
+        return Mock()
+
+    with patch.object(worker.time, "monotonic", side_effect=lambda: clock[0]), \
+         patch.object(worker.threading, "Event", side_effect=events), \
+         patch.object(worker.threading, "Thread", side_effect=thread), \
+         patch.object(match, "target", return_value=(b"\xc3", [], job)), \
+         patch.object(match, "_functions", return_value={job["addr"]: job}), \
+         patch.object(match, "disasm", return_value=["ret "]), \
+         patch.object(match, "check_text", return_value=(50, "f", "diff", [])), \
+         patch.object(draft, "facts_from_asm", return_value={}), \
+         patch.object(draft, "target_data_facts", return_value={}), \
+         patch("roc.abi_graph.target_evidence", return_value={}), \
+         patch.object(worker, "callee_source_hints", return_value=[]), \
+         patch.object(metrics, "quarantined_keys", return_value=set()), \
+         patch("roc.auto.candidates", return_value=[]), \
+         patch("roc.refsource.compile_candidates", return_value=None), \
+         patch("roc.refsource.prompt_hints", return_value=[]), \
+         patch.object(draft, "llm_rounds", side_effect=rounds):
+        assert worker.work_one(api, "tester", job, {"clients": {"C": {}}}, "local", 4,
+                               False, logs.append) == expected
+    assert any("job stalled" in line for line in logs) == (kind == "silent")
+    assert any("600-second" in line for line in logs) == (elapsed == 601)
+
+
+def test_model_does_not_start_another_round_after_lease_loss():
+    active = Mock(side_effect=[None, RuntimeError("lease lost")])
+    with patch.object(match, "target", return_value=(b"\xc3", [], {"size": 16, "unit": "U"})), \
+         patch.object(match, "disasm", return_value=["ret "]), \
+         patch.object(draft, "prompt_for", return_value="p"), \
+         patch.object(draft, "_ask_context", return_value=("int f() {}", None, {})) as ask, \
+         patch.object(match, "check_text") as check:
+        with pytest.raises(RuntimeError, match="lease lost"):
+            draft.llm_rounds("C", "00401000", "local", 4, log=lambda _: None,
+                             provider_options={"check_active": active})
+    ask.assert_called_once()
+    check.assert_not_called()
+
+
+def test_missing_library_compiler_is_reported_before_preprocessing():
+    source = "// roc-cl: 99998\n// roc-lib: library unit.cpp\n"
+    with patch.object(match.clients, "load", return_value={"C": {"compiler_build": 21022}}), \
+         patch.object(match.setup, "compilers", return_value={}), \
+         patch("roc.libs.unit") as unit:
+        with pytest.raises(match.CompileError, match="Missing compiler build 99998"):
+            match.compile_text("C", source)
+    unit.assert_not_called()
 
 
 def test_recent_metrics_tail_cache_append_and_corrupt_rows(tmp_path):
@@ -135,6 +212,7 @@ def test_example_cache_preserves_family_provenance(family, strict, rewrite, scor
 
     class Api:
         server, token = "http://localhost:8765", None
+        servers = [server]
 
         def call(self, path, data=None):
             calls.append((path, data))

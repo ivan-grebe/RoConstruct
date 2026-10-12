@@ -208,6 +208,7 @@ def complete(text="int f() { return 1; }"):
 
 def test_sdk_stream_requires_completion_and_uses_plan_contract(monkeypatch):
     sent = []
+    progress = []
     def handler(request):
         sent.append(json.loads(request.content))
         assert request.headers["authorization"] == "Bearer oauth-test"
@@ -216,7 +217,9 @@ def test_sdk_stream_requires_completion_and_uses_plan_contract(monkeypatch):
                text=sse([{"type": "response.output_text.delta", "delta": "int f() { return 1; }"}, complete()]))
     sdk_client(monkeypatch, handler)
     result = providers.generate("chatgpt:model-test", "write cpp", options={"allow_cloud": True, "max_tokens": 128,
-                                "temperature": 0.2, "seed": 1, "reasoning_effort": "high"})
+                                "temperature": 0.2, "seed": 1, "reasoning_effort": "high",
+                                "on_progress": lambda: progress.append(True)})
+    assert len(progress) == 2
     assert result.text == "int f() { return 1; }" and result.finish_reason == "completed"
     assert result.input_tokens == 10 and result.reasoning_tokens == 3 and result.cached_tokens == 2
     assert result.request_id == "req_123" and result.cost is None
@@ -225,6 +228,18 @@ def test_sdk_stream_requires_completion_and_uses_plan_contract(monkeypatch):
     assert body["instructions"] == providers.SYSTEM
     assert all(message["role"] != "system" for message in body["input"])
     assert not {"max_output_tokens", "temperature", "seed", "previous_response_id"}.intersection(body)
+
+
+def test_stream_stops_when_worker_lease_expires(monkeypatch):
+    sdk_client(monkeypatch, lambda request: httpx.Response(200,
+        headers={"content-type": "text/event-stream"},
+        text=sse([{"type": "response.output_text.delta", "delta": "int f() {}"}, complete()])))
+
+    def expired():
+        raise TimeoutError("job deadline reached")
+
+    with pytest.raises(TimeoutError, match="job deadline reached"):
+        providers.generate("chatgpt:model-test", "p", options={"allow_cloud": True, "on_progress": expired})
 
 
 @pytest.mark.parametrize("terminal", [None, {"type": "response.incomplete", "response": complete()["response"]}])

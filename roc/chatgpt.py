@@ -482,6 +482,8 @@ def generate(remote, messages, options):
             with client.responses.create(**body) as stream:
                 request_id = stream.response.headers.get("x-request-id", "")
                 for event in stream:
+                    if options.get("on_progress"):
+                        options["on_progress"]()
                     if event.type == "response.output_text.delta":
                         text_size += len(event.delta)
                         # A local memory guard, not a server token/billing cap.

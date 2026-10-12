@@ -612,6 +612,8 @@ def generate(model, messages, options=None, state=None):
         while True:
             ticket = None
             try:
+                if options.get("check_active"):
+                    options["check_active"]()
                 if budget:
                     ticket = budget.reserve(estimate_tokens,
                                             _cost(config, estimate_input, int(options["max_tokens"]), remote) or 0.0)

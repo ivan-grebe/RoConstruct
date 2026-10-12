@@ -808,6 +808,7 @@ def llm_rounds_k(client, addr, model, rounds=4, hint=None, start=None, log=print
     """Ask/compile/diff loop. Returns (best score, best source, top-k list)."""
     from roc import repair as _repair
     from roc import mutate as _mutate
+    check = (provider_options or {}).get("check_candidate") or match.check_text
     code, _, row = match.target(client, addr)
     strategy = select_generation_strategy(strategy, model, row)
     asm = match.disasm(code, int(addr, 16))
@@ -816,7 +817,7 @@ def llm_rounds_k(client, addr, model, rounds=4, hint=None, start=None, log=print
     compiled_best = None
     if best[1]:
         try:
-            attempt = (best[1],) + match.check_text(client, addr, best[1], flags)[0:3:2]
+            attempt = (best[1],) + check(client, addr, best[1], flags)[0:3:2]
             best = (attempt[1], attempt[0])
             compiled_best = best
         except match.CompileError as error:
@@ -839,6 +840,8 @@ def llm_rounds_k(client, addr, model, rounds=4, hint=None, start=None, log=print
     asm_strikes = 0  # repeat asm dumps rarely learn: 72% repeat after the first
     retry_output_tokens = None
     for i in range(rounds):
+        if (provider_options or {}).get("check_active"):
+            provider_options["check_active"]()
         # Near-repair must see its supplied source in round one; explicit
         # diversity and normal generation retain independent starting draws.
         independent = i < diverse_rounds and (requested_diversity > 1 or attempt is None or
@@ -898,6 +901,8 @@ def llm_rounds_k(client, addr, model, rounds=4, hint=None, start=None, log=print
             asked = _ask_context(model, prompt, context, ask_options, details=True)
         except TypeError:
             asked = _ask_context(model, prompt, context)
+        if (provider_options or {}).get("check_active"):
+            provider_options["check_active"]()
         reply, context = asked[:2]
         generation = dict(asked[2] if len(asked) > 2 else {})
         generated_tokens = generation.pop("output_tokens", 0)
@@ -1014,7 +1019,7 @@ def llm_rounds_k(client, addr, model, rounds=4, hint=None, start=None, log=print
             this = (src, score, seen[key][3])
         else:
             try:
-                checked = match.check_text(client, addr, src, flags, include_diagnosis=True)
+                checked = check(client, addr, src, flags, include_diagnosis=True)
                 score, _, d, _ = checked[:4]
                 diag = checked[4] if len(checked) > 4 else None
                 this = (src, score, d)
@@ -1026,7 +1031,7 @@ def llm_rounds_k(client, addr, model, rounds=4, hint=None, start=None, log=print
             except match.CompileError as error:
                 raw = str(error)
                 rscore, rsrc, _, rdiff, _, applied, rerr = _repair.repair_loop(
-                    client, addr, src, flags, check=match.check_text)
+                    client, addr, src, flags, check=check)
                 if applied:
                     repaired.extend(applied)
                 if rerr is None:
@@ -1081,6 +1086,7 @@ def llm_rounds_k(client, addr, model, rounds=4, hint=None, start=None, log=print
             break
     if compiled_best is not None and best[0] < 100:
         result = _mutate.improve(client, addr, compiled_best[1], flags,
+                                 check=check,
                                  guided=bool((provider_options or {}).get("guided_mutations")))
         mscore, msrc, tried = result[0], result[1], result[2]
         if stats is not None:

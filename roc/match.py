@@ -672,6 +672,9 @@ def compile_text(client, text, flags=None, build=None):
     known_error = _compile_error_cache().get(error_key)
     if known_error:
         raise CompileError(known_error)
+    cl = setup.compilers().get(build)
+    if not cl:
+        raise CompileError("Missing compiler build %s for %s. Run: roc install" % (build, client))
     if "archive" in d:  # exact CRT/STL COFF member from matching installed compiler
         from roc import libs
         recipe, _, path = d["archive"].partition(" ")
@@ -683,9 +686,6 @@ def compile_text(client, text, flags=None, build=None):
             text = "%s\n%s" % (text, libs.unit(recipe, path.strip(), build))
         except SystemExit as error:  # local-only tree (e.g. rbxgs) not on this PC
             raise CompileError(str(error))
-    cl = setup.compilers().get(build)
-    if not cl:
-        raise SystemExit("Missing compiler build %s for %s. Run: roc install" % (build, client))
     env = setup.cl_env(cl)
     flags = (flags or d.get("flags") or entry.get("flags") or DEFAULT_FLAGS).split()
     with tempfile.TemporaryDirectory() as tmp:

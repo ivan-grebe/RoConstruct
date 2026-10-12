@@ -143,6 +143,7 @@ def test_budget_rejection_releases_lease_and_marks_stop(tmp_path):
 
     class Api:
         server, token = "http://localhost:8765", None
+        servers = [server]
 
         def call(self, path, data=None):
             calls.append(path)

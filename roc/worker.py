@@ -563,7 +563,10 @@ class Api:
         if self.token:
             headers["X-Roc-Token"] = self.token
         method = "POST" if data is not None else "GET"
-        tries = max(3, len(self.servers) * 2) if payload is None or len(self.servers) > 1 or request_id else 1
+        # Renewing the same lease is idempotent. A dropped connection or gateway
+        # error must not discard a job after just one heartbeat attempt.
+        tries = max(3, len(self.servers) * 2) if (payload is None or path == "/v1/heartbeat"
+                                                or len(self.servers) > 1 or request_id) else 1
         for attempt in range(max(tries, 12 if path in ("/v1/submit", "/v1/submit-batch") else 0)):
             try:
                 conn = self._get_conn(timeout)
@@ -583,7 +586,7 @@ class Api:
                 body = resp.read()
                 if resp.status >= 400:
                     try:
-                        msg = json.loads(body).get("error")
+                        msg = json.loads(body).get("error") or resp.reason
                     except (ValueError, AttributeError):
                         msg = resp.reason
                     category = "auth_fail" if resp.status in (401, 403) else \
@@ -957,16 +960,17 @@ def work_one(api, user, job, info, model, rounds, revng, log, examples_cache=Non
     from roc import providers
     compact_log = isinstance(log, CompactLog)
     output = log
-    progress = {"stage": "starting", "at": time.monotonic(), "began": time.monotonic()}
+    progress = {"stage": "starting", "at": time.monotonic(), "active_at": time.monotonic()}
     stalled = threading.Event()
 
     def stage(name):
         progress["stage"] = name
         progress["at"] = time.monotonic()
-        progress["began"] = progress["at"]
+        progress["active_at"] = progress["at"]
 
     def job_log(message):
         progress["at"] = time.monotonic()
+        progress["active_at"] = progress["at"]
         output(message)
 
     log = job_log
@@ -995,14 +999,22 @@ def work_one(api, user, job, info, model, rounds, revng, log, examples_cache=Non
         # thread's api here raced self._conn, forcing a new socket per call and
         # exhausting ephemeral ports (WinError 10048).
         hb = Api(",".join(api.servers), api.token)
-        while not stop.wait(job.get("heartbeat", 60)):
-            try:
-                if not hb.call("/v1/heartbeat", {"lease": job["lease"]}).get("ok"):
+        interval = job.get("heartbeat", 60)
+        try:
+            while not stop.wait(interval):
+                try:
+                    if hb.call("/v1/heartbeat", {"lease": job["lease"]},
+                               timeout=min(60, interval / 3)).get("ok"):
+                        continue
+                    output("  heartbeat rejected: server no longer owns this lease.")
                     lease_lost.set()
                     return
-            except RuntimeError:
-                lease_lost.set()
-                return
+                except RuntimeError as error:
+                    output("  heartbeat failed after retries: %s" % error)
+                    lease_lost.set()
+                    return
+        finally:
+            hb.close()
 
     def ensure_lease():
         if lease_lost.is_set():
@@ -1012,13 +1024,24 @@ def work_one(api, user, job, info, model, rounds, revng, log, examples_cache=Non
         if time.monotonic() >= deadline:
             raise TimeoutError("job exceeded 600-second worker limit")
 
+    def model_progress():
+        ensure_lease()
+        progress["active_at"] = time.monotonic()
+
+    def check_candidate(*args, **kwargs):
+        ensure_lease()
+        try:
+            return match.check_text(*args, **kwargs)
+        finally:
+            model_progress()
+
     def watchdog():
         while not stop.wait(30):
             quiet = int(time.monotonic() - progress["at"])
             if quiet >= 30:
                 output("  still working (%ds): %s." % (quiet, progress["stage"]))
                 progress["at"] = time.monotonic()
-            if time.monotonic() - progress["began"] >= 300:
+            if time.monotonic() - progress["active_at"] >= 300:
                 stalled.set()
                 output("  stuck 5m in %s; restarting job after current call." % progress["stage"])
                 return
@@ -1076,7 +1099,7 @@ def work_one(api, user, job, info, model, rounds, revng, log, examples_cache=Non
             ensure_lease()
             stage("compiler repair")
             repair_started = time.monotonic()
-            repaired = mutate.improve(client, addr, repair_source, flags, guided=True,
+            repaired = mutate.improve(client, addr, repair_source, flags, check=check_candidate, guided=True,
                                       guided_categories=abi_categories if (provider_options or {}).get("abi_only") else None)
             baseline_diagnosis = repaired.diagnosis
             repair_seconds = round(time.monotonic() - repair_started, 3)
@@ -1203,6 +1226,9 @@ def work_one(api, user, job, info, model, rounds, revng, log, examples_cache=Non
         stage("waiting for cloud model" if providers.is_cloud(model) else "waiting for local model")
         llm_options = dict(provider_options or {})
         llm_options["family_exemplars"] = strict_family_reference
+        llm_options["check_active"] = ensure_lease
+        llm_options["on_progress"] = model_progress
+        llm_options["check_candidate"] = check_candidate
         score, src = draft.llm_rounds(client, addr, model, draft.model_rounds(model, job_rounds), hint, llm_start,
                                       log, flags, examples, source_hints, facts, round_stats, strategy=strategy,
                                       provider_options=llm_options)
@@ -1214,7 +1240,7 @@ def work_one(api, user, job, info, model, rounds, revng, log, examples_cache=Non
             from roc import mutate
             stage("repairing generated partial")
             repair_started = time.monotonic()
-            repaired = mutate.improve(client, addr, src, flags, guided=True,
+            repaired = mutate.improve(client, addr, src, flags, check=check_candidate, guided=True,
                                       guided_categories=abi_categories if (provider_options or {}).get("abi_only") else None)
             if not baseline_diagnosis:
                 baseline_diagnosis = repaired.diagnosis
